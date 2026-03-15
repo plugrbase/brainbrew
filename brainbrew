@@ -1,0 +1,1212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_source="${BASH_SOURCE[0]}"
+while [ -L "$_source" ]; do
+    _dir="$(cd "$(dirname "$_source")" && pwd)"
+    _source="$(readlink "$_source")"
+    [[ "$_source" != /* ]] && _source="$_dir/$_source"
+done
+BRAINBREW_DIR="$(cd "$(dirname "$_source")" && pwd)"
+unset _source _dir
+REPOS_DIR=".ai-repos"
+CONFIG_FILE=".brainbrew.yml"
+OUTPUT_FILE="AGENTS.md"
+DEFAULT_REPO="plugrbase/brainbrew-modules-test"
+DEFAULT_BRANCH="main"
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+DIM=$'\033[2m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
+
+info()    { echo -e "${BLUE}▸${NC} $1"; }
+success() { echo -e "${GREEN}✓${NC} $1"; }
+warn()    { echo -e "${YELLOW}⚠${NC} $1"; }
+error()   { echo -e "${RED}✗${NC} $1"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# parse_repos_config — extract repo entries from a YAML config file
+# Output: one line per repo as "owner/repo|branch|path"
+# ---------------------------------------------------------------------------
+parse_repos_config() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+
+    local in_repos=false
+    local repo="" branch="main" rpath=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^[a-z_] ]] && [[ "$line" != "repos:" ]]; then
+            if $in_repos && [ -n "$repo" ]; then
+                echo "$repo|$branch|$rpath"
+            fi
+            in_repos=false
+            repo=""
+            continue
+        fi
+
+        if [[ "$line" == "repos:" ]]; then
+            in_repos=true
+            repo="" branch="main" rpath=""
+            continue
+        fi
+
+        if $in_repos; then
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*repo:[[:space:]]*(.*) ]]; then
+                if [ -n "$repo" ]; then
+                    echo "$repo|$branch|$rpath"
+                fi
+                repo="${BASH_REMATCH[1]}"
+                branch="main"
+                rpath=""
+            elif [[ "$line" =~ ^[[:space:]]+branch:[[:space:]]*(.*) ]]; then
+                branch="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+path:[[:space:]]*(.*) ]]; then
+                rpath="${BASH_REMATCH[1]}"
+            fi
+        fi
+    done < "$file"
+
+    if $in_repos && [ -n "$repo" ]; then
+        echo "$repo|$branch|$rpath"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# get_github_token — resolve GitHub token from GITHUB_TOKEN env
+# ---------------------------------------------------------------------------
+get_github_token() {
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        echo "$GITHUB_TOKEN"
+        return 0
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# resolve_module — find a module file in synced GitHub repos
+# ---------------------------------------------------------------------------
+resolve_module() {
+    local module="$1"
+
+    for repo_dir in "$REPOS_DIR"/*/*/; do
+        [ -d "$repo_dir" ] || continue
+        if [ -f "${repo_dir}$module.md" ]; then
+            echo "${repo_dir}$module.md"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+module_source_label() {
+    local path="$1"
+    if [[ "$path" == "$REPOS_DIR/"* ]]; then
+        local rel="${path#$REPOS_DIR/}"
+        local owner="${rel%%/*}"
+        rel="${rel#*/}"
+        local repo_name="${rel%%/*}"
+        echo "$owner/$repo_name"
+    else
+        echo "unknown"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# discover_modules — find all available modules from synced repos
+# Populates global arrays: PICKER_MODULES[], PICKER_SOURCES[]
+# ---------------------------------------------------------------------------
+discover_modules() {
+    PICKER_MODULES=()
+    PICKER_SOURCES=()
+
+    _discover_scan() {
+        local dir="$1"
+        local source="$2"
+        [ -d "$dir" ] || return 0
+        while IFS= read -r file; do
+            local rel="${file#$dir}"
+            local module="${rel%.md}"
+            [[ "$module" == *".example" ]] && continue
+            [[ "$module" == *".gitkeep" ]] && continue
+            local already=false
+            for ((j=0; j<${#PICKER_MODULES[@]}; j++)); do
+                if [ "${PICKER_MODULES[$j]}" = "$module" ]; then
+                    already=true
+                    break
+                fi
+            done
+            $already && continue
+            PICKER_MODULES+=("$module")
+            PICKER_SOURCES+=("$source")
+        done < <(find "$dir" -name "*.md" -type f 2>/dev/null | sort)
+    }
+
+    for repo_dir in "$REPOS_DIR"/*/*/; do
+        [ -d "$repo_dir" ] || continue
+        local repo_name
+        repo_name="$(basename "$(dirname "$repo_dir")")/$(basename "$repo_dir")"
+        _discover_scan "$repo_dir" "$repo_name"
+    done
+
+    local count=${#PICKER_MODULES[@]}
+    [ "$count" -le 1 ] && return 0
+
+    local sorted_lines
+    sorted_lines=$(for ((i=0; i<count; i++)); do
+        printf '%s\t%s\n' "${PICKER_MODULES[$i]}" "${PICKER_SOURCES[$i]}"
+    done | sort -t$'\t' -k1,1)
+
+    PICKER_MODULES=()
+    PICKER_SOURCES=()
+    while IFS=$'\t' read -r mod src; do
+        PICKER_MODULES+=("$mod")
+        PICKER_SOURCES+=("$src")
+    done <<< "$sorted_lines"
+}
+
+# ---------------------------------------------------------------------------
+# render_picker — display interactive module selection menu (re-renders in place)
+# ---------------------------------------------------------------------------
+render_picker() {
+    if [ "${PICKER_RENDERED_LINES:-0}" -gt 0 ]; then
+        printf '\033[%dA\033[J' "$PICKER_RENDERED_LINES"
+    fi
+
+    local lines=0
+    local current_category=""
+    local count=${#PICKER_MODULES[@]}
+    local cursor="${PICKER_CURSOR:-0}"
+
+    echo ""
+    echo -e "  ${BOLD}BrainBrew — Select modules${NC}"
+    echo ""
+    lines=3
+
+    for ((i=0; i<count; i++)); do
+        local module="${PICKER_MODULES[$i]}"
+        local category
+        if [[ "$module" == */* ]]; then
+            category="${module%%/*}"
+        else
+            category="$module"
+        fi
+        local display_cat
+        display_cat="$(tr '[:lower:]' '[:upper:]' <<< "${category:0:1}")${category:1}"
+
+        if [ "$display_cat" != "$current_category" ]; then
+            if [ -n "$current_category" ]; then
+                echo ""
+                lines=$((lines + 1))
+            fi
+            echo -e "  ${BOLD}${display_cat}${NC}"
+            current_category="$display_cat"
+            lines=$((lines + 1))
+        fi
+
+        local active=false
+        [ "$i" -eq "$cursor" ] && active=true
+
+        local selected=false
+        [ "${PICKER_SELECTED[$i]}" = "1" ] && selected=true
+
+        if $active && $selected; then
+            echo -e "  ${CYAN}› ◼${NC} ${module}"
+        elif $active; then
+            echo -e "  ${CYAN}›${NC} ◻ ${module}"
+        elif $selected; then
+            echo -e "    ${CYAN}◼${NC} ${DIM}${module}${NC}"
+        else
+            echo -e "    ${DIM}◻ ${module}${NC}"
+        fi
+        lines=$((lines + 1))
+    done
+
+    echo ""
+    echo -e "  ${DIM}↑/↓ navigate  ␣ toggle  a all  ⏎ confirm${NC}"
+    lines=$((lines + 2))
+
+    PICKER_RENDERED_LINES=$lines
+}
+
+# ---------------------------------------------------------------------------
+# pick_modules — interactive module picker, returns selected in PICKED_MODULES[]
+# ---------------------------------------------------------------------------
+pick_modules() {
+    discover_modules
+
+    local count=${#PICKER_MODULES[@]}
+    if [ "$count" -eq 0 ]; then
+        warn "No modules found. Check that sync-repos fetched modules."
+        return 1
+    fi
+
+    PICKER_SELECTED=()
+    PICKER_CURSOR=0
+    for ((i=0; i<count; i++)); do
+        local sel="0"
+        for pre in "$@"; do
+            if [ "${PICKER_MODULES[$i]}" = "$pre" ]; then
+                sel="1"
+                break
+            fi
+        done
+        PICKER_SELECTED+=("$sel")
+    done
+
+    picker_cursor_up() {
+        PICKER_CURSOR=$(( (PICKER_CURSOR - 1 + count) % count ))
+    }
+
+    picker_cursor_down() {
+        PICKER_CURSOR=$(( (PICKER_CURSOR + 1) % count ))
+    }
+
+    picker_toggle_current() {
+        if [ "${PICKER_SELECTED[$PICKER_CURSOR]}" = "1" ]; then
+            PICKER_SELECTED[$PICKER_CURSOR]="0"
+        else
+            PICKER_SELECTED[$PICKER_CURSOR]="1"
+        fi
+    }
+
+    picker_toggle_all() {
+        local any_unselected=false
+        for ((i=0; i<count; i++)); do
+            if [ "${PICKER_SELECTED[$i]}" = "0" ]; then
+                any_unselected=true
+                break
+            fi
+        done
+        local val="1"
+        $any_unselected || val="0"
+        for ((i=0; i<count; i++)); do
+            PICKER_SELECTED[$i]="$val"
+        done
+    }
+
+    tput civis 2>/dev/null
+    trap 'tput cnorm 2>/dev/null' EXIT INT TERM
+
+    PICKER_RENDERED_LINES=0
+    render_picker
+
+    while true; do
+        IFS= read -rsn1 key
+        case "$key" in
+            $'\x1b')
+                read -rsn2 seq
+                case "$seq" in
+                    '[A'|'[D') picker_cursor_up ;;
+                    '[B'|'[C') picker_cursor_down ;;
+                esac
+                ;;
+            ' ')  picker_toggle_current ;;
+            a|A)  picker_toggle_all ;;
+            '')   break ;;
+        esac
+        render_picker
+    done
+
+    tput cnorm 2>/dev/null
+    trap - EXIT INT TERM
+
+    PICKED_MODULES=()
+    for ((i=0; i<count; i++)); do
+        if [ "${PICKER_SELECTED[$i]}" = "1" ]; then
+            PICKED_MODULES+=("${PICKER_MODULES[$i]}")
+        fi
+    done
+
+    [ ${#PICKED_MODULES[@]} -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# list — show available modules from synced repos
+# ---------------------------------------------------------------------------
+cmd_list() {
+    local has_modules=false
+
+    for repo_dir in "$REPOS_DIR"/*/*/; do
+        [ -d "$repo_dir" ] || continue
+        if [ "$(find "$repo_dir" -name "*.md" -type f 2>/dev/null | head -1)" ]; then
+            has_modules=true
+            break
+        fi
+    done
+
+    if ! $has_modules; then
+        warn "No modules found. Run 'brainbrew sync-repos' first."
+        echo ""
+        return
+    fi
+
+    echo ""
+    echo -e "${BOLD}Available modules:${NC}"
+    echo ""
+    for repo_dir in "$REPOS_DIR"/*/*/; do
+        [ -d "$repo_dir" ] || continue
+        local repo_name
+        repo_name="$(basename "$(dirname "$repo_dir")")/$(basename "$repo_dir")"
+        while IFS= read -r file; do
+            local rel="${file#$repo_dir}"
+            local module="${rel%.md}"
+            local title
+            title=$(head -1 "$file" | sed 's/^#* *//')
+            printf "  ${BLUE}%-35s${NC} %s  ${DIM}(%s)${NC}\n" "$module" "$title" "$repo_name"
+        done < <(find "$repo_dir" -name "*.md" -type f 2>/dev/null | sort)
+    done
+
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# init — create .brainbrew.yml: ask for repo, sync, pick modules
+# ---------------------------------------------------------------------------
+cmd_init() {
+    if [ -f "$CONFIG_FILE" ]; then
+        warn "$CONFIG_FILE already exists."
+        read -rp "Overwrite? [y/N] " reply
+        [[ ! "$reply" =~ ^[Yy]$ ]] && exit 0
+    fi
+
+    echo ""
+    echo -e "${BOLD}BrainBrew — Project Setup${NC}"
+    echo ""
+
+    local use_defaults=false
+    local repo_input="" branch_input="" path_input=""
+
+    read -rp "Include default BrainBrew modules? [Y/n]: " defaults_reply
+    if [[ ! "$defaults_reply" =~ ^[Nn]$ ]]; then
+        use_defaults=true
+    fi
+
+    if $use_defaults; then
+        read -rp "Additional GitHub repo (optional): " repo_input
+    else
+        read -rp "GitHub repo (e.g. user/ai-modules): " repo_input
+        [ -z "$repo_input" ] && error "A GitHub repo is required."
+    fi
+
+    if [ -n "$repo_input" ]; then
+        read -rp "Branch [main]: " branch_input
+        branch_input="${branch_input:-main}"
+        read -rp "Path (subfolder, optional): " path_input
+    fi
+
+    _write_repos_section() {
+        echo "repos:"
+        if $use_defaults; then
+            echo "  - repo: $DEFAULT_REPO"
+            echo "    branch: $DEFAULT_BRANCH"
+        fi
+        if [ -n "$repo_input" ]; then
+            echo "  - repo: $repo_input"
+            echo "    branch: $branch_input"
+            if [ -n "$path_input" ]; then
+                echo "    path: $path_input"
+            fi
+        fi
+    }
+
+    {
+        echo "# Brainbrew — modules to compose into $OUTPUT_FILE"
+        echo "modules:"
+        echo "  # Will be filled after module selection"
+        echo ""
+        _write_repos_section
+        echo ""
+        echo "# Project-specific rules (appended as last section)"
+        echo "# project_rules: |"
+        echo "#   - Your custom rule here"
+    } > "$CONFIG_FILE"
+
+    echo ""
+    cmd_sync_repos
+
+    if pick_modules; then
+        {
+            echo "# Brainbrew — modules to compose into $OUTPUT_FILE"
+            echo "modules:"
+            for m in "${PICKED_MODULES[@]}"; do
+                echo "  - $m"
+            done
+            echo ""
+            _write_repos_section
+            echo ""
+            echo "# Project-specific rules (appended as last section)"
+            echo "# project_rules: |"
+            echo "#   - Your custom rule here"
+        } > "$CONFIG_FILE"
+
+        echo ""
+        success "Created $CONFIG_FILE (${#PICKED_MODULES[@]} modules)"
+        cmd_compose
+    else
+        warn "No modules selected."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# add <module> — append a module to .brainbrew.yml and recompose
+# ---------------------------------------------------------------------------
+cmd_add() {
+    local module="$1"
+
+    [ -f "$CONFIG_FILE" ] || error "No $CONFIG_FILE found. Run 'brainbrew init' first."
+
+    if ! resolve_module "$module" > /dev/null 2>&1; then
+        error "Module '$module' not found. Run 'brainbrew sync-repos' then 'brainbrew list'."
+    fi
+
+    if grep -q "  - $module$" "$CONFIG_FILE" 2>/dev/null; then
+        warn "Module '$module' is already included."
+        return
+    fi
+
+    sed -i '' "/^modules:/a\\
+\\  - $module" "$CONFIG_FILE"
+
+    local resolved
+    resolved=$(resolve_module "$module")
+    local source
+    source=$(module_source_label "$resolved")
+    success "Added module: $module ($source)"
+    cmd_compose
+}
+
+# ---------------------------------------------------------------------------
+# remove <module> — remove a module from .brainbrew.yml and recompose
+# ---------------------------------------------------------------------------
+cmd_remove() {
+    local module="$1"
+
+    [ -f "$CONFIG_FILE" ] || error "No $CONFIG_FILE found."
+
+    sed -i '' "/^  - ${module}$/d" "$CONFIG_FILE"
+    success "Removed module: $module"
+    cmd_compose
+}
+
+# ---------------------------------------------------------------------------
+# _read_configured_modules — extract module names from .brainbrew.yml
+# Populates global array: CONFIGURED_MODULES[]
+# ---------------------------------------------------------------------------
+_read_configured_modules() {
+    CONFIGURED_MODULES=()
+    [ -f "$CONFIG_FILE" ] || return 0
+
+    local in_modules=false
+    while IFS= read -r line; do
+        if [[ "$line" == "modules:" ]]; then
+            in_modules=true
+            continue
+        fi
+        if $in_modules; then
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+(.*) ]]; then
+                CONFIGURED_MODULES+=("${BASH_REMATCH[1]}")
+            elif [[ ! "$line" =~ ^[[:space:]]*$ && ! "$line" =~ ^[[:space:]]*# ]]; then
+                break
+            fi
+        fi
+    done < "$CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# _write_modules_to_config — replace the modules section in .brainbrew.yml
+# Uses global array: PICKED_MODULES[]
+# ---------------------------------------------------------------------------
+_write_modules_to_config() {
+    local tmp="/tmp/brainbrew_modules_$$.yml"
+    > "$tmp"
+    local in_modules=false
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" == "modules:" ]]; then
+            in_modules=true
+            echo "modules:" >> "$tmp"
+            for m in "${PICKED_MODULES[@]}"; do
+                echo "  - $m" >> "$tmp"
+            done
+            continue
+        fi
+        if $in_modules; then
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]] || [[ "$line" =~ ^[[:space:]]*#[[:space:]] ]] || [[ -z "$line" ]]; then
+                continue
+            fi
+            in_modules=false
+        fi
+        echo "$line" >> "$tmp"
+    done < "$CONFIG_FILE"
+
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# _append_repo — add a repo entry to the repos: section in .brainbrew.yml
+# ---------------------------------------------------------------------------
+_append_repo() {
+    local repo="$1" branch="$2" rpath="${3:-}"
+
+    local existing
+    existing=$(parse_repos_config "$CONFIG_FILE")
+    while IFS='|' read -r r _ _; do
+        if [ "$r" = "$repo" ]; then
+            warn "Repo '$repo' is already configured."
+            return 1
+        fi
+    done <<< "$existing"
+
+    local entry="  - repo: $repo"$'\n'"    branch: $branch"
+    if [ -n "$rpath" ]; then
+        entry+=$'\n'"    path: $rpath"
+    fi
+
+    if grep -q "^repos:" "$CONFIG_FILE" 2>/dev/null; then
+        local last_repo_line
+        last_repo_line=$(grep -n "^  - repo:" "$CONFIG_FILE" | tail -1 | cut -d: -f1)
+        if [ -n "$last_repo_line" ]; then
+            local insert_after="$last_repo_line"
+            local total_lines
+            total_lines=$(wc -l < "$CONFIG_FILE" | tr -d ' ')
+            for ((line=last_repo_line+1; line<=total_lines; line++)); do
+                local content
+                content=$(sed -n "${line}p" "$CONFIG_FILE")
+                if [[ "$content" =~ ^[[:space:]]+(branch|path): ]]; then
+                    insert_after="$line"
+                else
+                    break
+                fi
+            done
+            local tmp="/tmp/brainbrew_insert_$$.yml"
+            head -n "$insert_after" "$CONFIG_FILE" > "$tmp"
+            echo "$entry" >> "$tmp"
+            tail -n "+$((insert_after + 1))" "$CONFIG_FILE" >> "$tmp"
+            mv "$tmp" "$CONFIG_FILE"
+        fi
+    fi
+
+    success "Added repo: $repo (branch: $branch${rpath:+, path: $rpath})"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# update — add default or custom repos to an existing project
+# ---------------------------------------------------------------------------
+cmd_update() {
+    [ -f "$CONFIG_FILE" ] || error "No $CONFIG_FILE found. Run 'brainbrew init' first."
+
+    local added=false
+
+    if [ "${1:-}" = "--defaults" ]; then
+        if _append_repo "$DEFAULT_REPO" "$DEFAULT_BRANCH"; then
+            added=true
+        fi
+    elif [ -n "${1:-}" ]; then
+        local repo_input="$1"
+        local branch_input
+        read -rp "Branch [main]: " branch_input
+        branch_input="${branch_input:-main}"
+        local path_input
+        read -rp "Path (subfolder, optional): " path_input
+        if _append_repo "$repo_input" "$branch_input" "$path_input"; then
+            added=true
+        fi
+    else
+        echo ""
+        echo -e "${BOLD}BrainBrew — Add Repo${NC}"
+        echo ""
+
+        local add_defaults=false
+        local existing
+        existing=$(parse_repos_config "$CONFIG_FILE")
+        local has_defaults=false
+        while IFS='|' read -r r _ _; do
+            [ "$r" = "$DEFAULT_REPO" ] && has_defaults=true
+        done <<< "$existing"
+
+        if ! $has_defaults; then
+            read -rp "Add default BrainBrew modules? [Y/n]: " defaults_reply
+            if [[ ! "$defaults_reply" =~ ^[Nn]$ ]]; then
+                _append_repo "$DEFAULT_REPO" "$DEFAULT_BRANCH" && added=true
+            fi
+        fi
+
+        read -rp "GitHub repo to add (optional): " repo_input
+        if [ -n "$repo_input" ]; then
+            local branch_input
+            read -rp "Branch [main]: " branch_input
+            branch_input="${branch_input:-main}"
+            local path_input
+            read -rp "Path (subfolder, optional): " path_input
+            _append_repo "$repo_input" "$branch_input" "$path_input" && added=true
+        fi
+    fi
+
+    if $added; then
+        echo ""
+        cmd_sync_repos
+
+        _read_configured_modules
+        local picker_ok=false
+        if [ ${#CONFIGURED_MODULES[@]} -gt 0 ]; then
+            pick_modules "${CONFIGURED_MODULES[@]}" && picker_ok=true
+        else
+            pick_modules && picker_ok=true
+        fi
+
+        if $picker_ok; then
+            _write_modules_to_config
+            echo ""
+            success "Updated $CONFIG_FILE (${#PICKED_MODULES[@]} modules)"
+            cmd_compose
+        else
+            warn "No modules selected."
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# collect_modules — gather module contents and project rules from config
+# Populates: COMPOSED_MODULES[], COMPOSED_CONTENTS[], COMPOSED_RULES
+# ---------------------------------------------------------------------------
+collect_modules() {
+    [ -f "$CONFIG_FILE" ] || error "No $CONFIG_FILE found. Run 'brainbrew init' first."
+
+    COMPOSED_MODULES=()
+    COMPOSED_CONTENTS=()
+    COMPOSED_RULES=""
+
+    local in_modules=false
+    while IFS= read -r line; do
+        if [[ "$line" == "modules:" ]]; then
+            in_modules=true
+            continue
+        fi
+        if $in_modules; then
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+(.*) ]]; then
+                local module="${BASH_REMATCH[1]}"
+                local file
+                if file=$(resolve_module "$module"); then
+                    COMPOSED_MODULES+=("$module")
+                    COMPOSED_CONTENTS+=("$(<"$file")")
+                else
+                    warn "Module not found: $module — run 'brainbrew sync-repos'"
+                fi
+            elif [[ ! "$line" =~ ^[[:space:]]*$ && ! "$line" =~ ^[[:space:]]*# ]]; then
+                in_modules=false
+            fi
+        fi
+    done < "$CONFIG_FILE"
+
+    local in_rules=false
+    while IFS= read -r line; do
+        if [[ "$line" == "project_rules: |" ]]; then
+            in_rules=true
+            continue
+        fi
+        if $in_rules; then
+            if [[ "$line" =~ ^[[:space:]]{2} ]]; then
+                COMPOSED_RULES+="${line#  }"$'\n'
+            else
+                in_rules=false
+            fi
+        fi
+    done < "$CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# write_section — replace only the brainbrew section in a file
+#   $1: file path
+#   $2: start marker
+#   $3: end marker
+#   $4: new section content (must include start/end markers)
+#   $5: optional header (prepended only when creating a new file)
+# ---------------------------------------------------------------------------
+write_section() {
+    local file="$1" start_marker="$2" end_marker="$3" section="$4" header="${5:-}"
+    local tmp_section="/tmp/brainbrew_section_$$.txt"
+    printf '%s\n' "$section" > "$tmp_section"
+
+    if [ ! -f "$file" ]; then
+        if [ -n "$header" ]; then
+            printf '%s\n\n' "$header" > "$file"
+            cat "$tmp_section" >> "$file"
+        else
+            cat "$tmp_section" > "$file"
+        fi
+        rm -f "$tmp_section"
+        return
+    fi
+
+    python3 -c "
+import sys
+with open(sys.argv[1]) as f:
+    content = f.read()
+with open(sys.argv[4]) as f:
+    new_section = f.read()
+start, end = sys.argv[2], sys.argv[3]
+si = content.find(start)
+ei = content.find(end, si + len(start)) if si >= 0 else -1
+if si >= 0 and ei >= 0:
+    result = content[:si] + new_section.rstrip('\n') + '\n' + content[ei + len(end):].lstrip('\n')
+else:
+    result = content.rstrip('\n') + '\n\n' + new_section
+with open(sys.argv[1], 'w') as f:
+    f.write(result)
+" "$file" "$start_marker" "$end_marker" "$tmp_section"
+
+    rm -f "$tmp_section"
+}
+
+# ---------------------------------------------------------------------------
+# Format adapters — each writes composed content in a tool-specific format
+# Content between markers is managed by brainbrew; the rest is preserved.
+# ---------------------------------------------------------------------------
+build_module_body() {
+    local body=""
+    local count=${#COMPOSED_MODULES[@]}
+    for ((i=0; i<count; i++)); do
+        body+=$'\n\n'"${COMPOSED_CONTENTS[$i]}"
+    done
+    if [ -n "$COMPOSED_RULES" ]; then
+        body+=$'\n\n'"---"$'\n\n'"# Project Rules"$'\n\n'"$COMPOSED_RULES"
+    fi
+    echo "$body"
+}
+
+write_format_agents() {
+    local count=${#COMPOSED_MODULES[@]}
+    local section="<brainbrew>"
+    for ((i=0; i<count; i++)); do
+        section+=$'\n\n'"=== ${COMPOSED_MODULES[$i]} ==="$'\n\n'"${COMPOSED_CONTENTS[$i]}"
+    done
+    if [ -n "$COMPOSED_RULES" ]; then
+        section+=$'\n\n'"=== project ==="$'\n\n'"# Project Rules"$'\n\n'"$COMPOSED_RULES"
+    fi
+    section+=$'\n\n'"</brainbrew>"
+
+    write_section "$OUTPUT_FILE" "<brainbrew>" "</brainbrew>" "$section"
+    success "Composed $OUTPUT_FILE ($count modules)"
+}
+
+write_format_copilot() {
+    mkdir -p .github
+    local count=${#COMPOSED_MODULES[@]}
+    local section="<!-- brainbrew:start -->"
+    section+="$(build_module_body)"
+    section+=$'\n'"<!-- brainbrew:end -->"
+
+    write_section ".github/copilot-instructions.md" \
+        "<!-- brainbrew:start -->" "<!-- brainbrew:end -->" "$section"
+    success "Composed .github/copilot-instructions.md ($count modules)"
+}
+
+write_format_cursor() {
+    mkdir -p .cursor/rules
+    local count=${#COMPOSED_MODULES[@]}
+    local header
+    header="---"$'\n'"description: Brainbrew personal AI context"$'\n'"alwaysApply: true"$'\n'"---"
+    local section="<!-- brainbrew:start -->"
+    section+="$(build_module_body)"
+    section+=$'\n'"<!-- brainbrew:end -->"
+
+    write_section ".cursor/rules/brainbrew.mdc" \
+        "<!-- brainbrew:start -->" "<!-- brainbrew:end -->" "$section" "$header"
+    success "Composed .cursor/rules/brainbrew.mdc ($count modules)"
+}
+
+write_format_windsurf() {
+    local count=${#COMPOSED_MODULES[@]}
+    local section="<!-- brainbrew:start -->"
+    section+="$(build_module_body)"
+    section+=$'\n'"<!-- brainbrew:end -->"
+
+    write_section ".windsurfrules" \
+        "<!-- brainbrew:start -->" "<!-- brainbrew:end -->" "$section"
+    success "Composed .windsurfrules ($count modules)"
+}
+
+write_format_claude() {
+    local count=${#COMPOSED_MODULES[@]}
+    local section="<!-- brainbrew:start -->"
+    section+="$(build_module_body)"
+    section+=$'\n'"<!-- brainbrew:end -->"
+
+    write_section "CLAUDE.md" \
+        "<!-- brainbrew:start -->" "<!-- brainbrew:end -->" "$section"
+    success "Composed CLAUDE.md ($count modules)"
+}
+
+# ---------------------------------------------------------------------------
+# compose — read .brainbrew.yml and generate output in the specified format
+# ---------------------------------------------------------------------------
+cmd_compose() {
+    local format="agents"
+    local all=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --format)
+                shift
+                format="${1:-}"
+                [ -z "$format" ] && error "Usage: brainbrew compose --format <agents|copilot|cursor|windsurf|claude>"
+                ;;
+            --all) all=true ;;
+            *)     error "Unknown option: $1" ;;
+        esac
+        shift
+    done
+
+    collect_modules
+
+    if $all; then
+        write_format_agents
+        write_format_copilot
+        write_format_cursor
+        write_format_windsurf
+        write_format_claude
+        return
+    fi
+
+    case "$format" in
+        agents)   write_format_agents ;;
+        copilot)  write_format_copilot ;;
+        cursor)   write_format_cursor ;;
+        windsurf) write_format_windsurf ;;
+        claude)   write_format_claude ;;
+        *)        error "Unknown format: $format. Use: agents, copilot, cursor, windsurf, claude" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# _sync_repo — fetch .md files from a single GitHub repo into local cache
+# ---------------------------------------------------------------------------
+_sync_repo() {
+    local repo="$1" branch="$2" rpath="$3" token="$4" dry_run="$5"
+    local cache_dir="$REPOS_DIR/$repo"
+    local tmp_tree="/tmp/brainbrew_tree_$$.json"
+    local tmp_files="/tmp/brainbrew_files_$$.txt"
+
+    info "Fetching $repo (branch: $branch, path: ${rpath:-/})..."
+
+    local tree_url="https://api.github.com/repos/$repo/git/trees/$branch?recursive=1"
+    local http_code
+
+    if [ -n "$token" ]; then
+        http_code=$(curl -s -o "$tmp_tree" -w "%{http_code}" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            "$tree_url")
+    else
+        http_code=$(curl -s -o "$tmp_tree" -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            "$tree_url")
+    fi
+
+    if [ "$http_code" != "200" ]; then
+        if [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+            warn "$repo: HTTP $http_code — export GITHUB_TOKEN for private repos."
+        else
+            warn "$repo: HTTP $http_code — skipping."
+        fi
+        rm -f "$tmp_tree"
+        return 0
+    fi
+
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+prefix = sys.argv[2].strip('/')
+if prefix:
+    prefix += '/'
+for item in data.get('tree', []):
+    if item['type'] != 'blob' or not item['path'].endswith('.md'):
+        continue
+    fp = item['path']
+    if prefix and not fp.startswith(prefix):
+        continue
+    rel = fp[len(prefix):] if prefix else fp
+    print(f'{fp}|{rel}')
+" "$tmp_tree" "$rpath" > "$tmp_files" 2>/dev/null
+
+    rm -f "$tmp_tree"
+
+    local file_count
+    file_count=$(wc -l < "$tmp_files" | tr -d ' ')
+
+    if [ "$file_count" -eq 0 ]; then
+        warn "$repo: no .md files found${rpath:+ under $rpath}."
+        rm -f "$tmp_files"
+        return 0
+    fi
+
+    if $dry_run; then
+        info "Would sync $file_count file(s) from $repo:"
+        while IFS='|' read -r _ rel; do
+            echo "    ${rel%.md}"
+        done < "$tmp_files"
+        rm -f "$tmp_files"
+        return 0
+    fi
+
+    mkdir -p "$cache_dir"
+
+    local synced=0
+    while IFS='|' read -r full_path rel_path; do
+        local target="$cache_dir/$rel_path"
+        mkdir -p "$(dirname "$target")"
+        local raw_url="https://raw.githubusercontent.com/$repo/$branch/$full_path"
+        local ok=false
+
+        if [ -n "$token" ]; then
+            curl -s -f -H "Authorization: Bearer $token" -o "$target" "$raw_url" 2>/dev/null && ok=true
+        else
+            curl -s -f -o "$target" "$raw_url" 2>/dev/null && ok=true
+        fi
+
+        if $ok; then
+            echo "    synced: ${rel_path%.md}"
+            synced=$((synced + 1))
+        else
+            warn "  failed: $full_path"
+        fi
+    done < "$tmp_files"
+
+    if [ -d "$cache_dir" ]; then
+        local tmp_expected="/tmp/brainbrew_expected_$$.txt"
+        cut -d'|' -f2 "$tmp_files" | sort > "$tmp_expected"
+        while IFS= read -r cached_file; do
+            local rel_cached="${cached_file#$cache_dir/}"
+            if ! grep -qxF "$rel_cached" "$tmp_expected" 2>/dev/null; then
+                rm -f "$cached_file"
+                info "  removed orphan: ${rel_cached%.md}"
+            fi
+        done < <(find "$cache_dir" -name "*.md" -type f 2>/dev/null)
+        find "$cache_dir" -type d -empty -delete 2>/dev/null || true
+        rm -f "$tmp_expected"
+    fi
+
+    rm -f "$tmp_files"
+    success "Synced $synced file(s) from $repo"
+}
+
+# ---------------------------------------------------------------------------
+# sync-repos — fetch .md files from configured GitHub repos
+# ---------------------------------------------------------------------------
+cmd_sync_repos() {
+    local dry_run=false
+    [ "${1:-}" = "--dry-run" ] && dry_run=true
+
+    [ -f "$CONFIG_FILE" ] || error "No $CONFIG_FILE found. Run 'brainbrew init' first."
+
+    local token
+    token=$(get_github_token)
+
+    local repos=""
+    repos=$(parse_repos_config "$CONFIG_FILE")
+
+    if [ -z "$repos" ]; then
+        warn "No repos configured in $CONFIG_FILE."
+        return
+    fi
+
+    while IFS='|' read -r repo branch rpath; do
+        [ -z "$repo" ] && continue
+        _sync_repo "$repo" "$branch" "$rpath" "$token" "$dry_run"
+    done <<< "$repos"
+}
+
+# ---------------------------------------------------------------------------
+# global — install Cursor rules & skills to ~/.cursor/
+# ---------------------------------------------------------------------------
+cmd_global() {
+    info "Installing global Cursor configuration..."
+
+    if [ -d "$BRAINBREW_DIR/cursor/rules" ]; then
+        mkdir -p "$HOME/.cursor/rules"
+        for file in "$BRAINBREW_DIR/cursor/rules/"*.mdc; do
+            [ -f "$file" ] || continue
+            local name
+            name=$(basename "$file")
+            ln -sf "$file" "$HOME/.cursor/rules/$name"
+            success "Linked rule: $name"
+        done
+    fi
+
+    if [ -d "$BRAINBREW_DIR/cursor/skills" ]; then
+        mkdir -p "$HOME/.cursor/skills"
+        for dir in "$BRAINBREW_DIR/cursor/skills/"*/; do
+            [ -d "$dir" ] || continue
+            local name
+            name=$(basename "$dir")
+            ln -sf "$dir" "$HOME/.cursor/skills/$name"
+            success "Linked skill: $name"
+        done
+    fi
+
+    success "Global configuration installed!"
+}
+
+# ---------------------------------------------------------------------------
+# link — symlink brainbrew to /usr/local/bin
+# ---------------------------------------------------------------------------
+cmd_link() {
+    local target="/usr/local/bin/brainbrew"
+
+    if [ -L "$target" ] || [ -f "$target" ]; then
+        warn "$target already exists."
+        read -rp "Overwrite? [y/N] " reply
+        [[ ! "$reply" =~ ^[Yy]$ ]] && exit 0
+    fi
+
+    ln -sf "$BRAINBREW_DIR/brainbrew" "$target"
+    success "brainbrew linked to $target"
+    info "You can now run 'brainbrew' from anywhere."
+}
+
+# ---------------------------------------------------------------------------
+# status — show current project configuration
+# ---------------------------------------------------------------------------
+cmd_status() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        warn "No $CONFIG_FILE found in this directory."
+        return
+    fi
+
+    local repo_configs=""
+    repo_configs=$(parse_repos_config "$CONFIG_FILE")
+
+    if [ -n "$repo_configs" ]; then
+        echo ""
+        echo -e "${BOLD}GitHub repos:${NC}"
+        echo ""
+        while IFS='|' read -r repo branch rpath; do
+            [ -z "$repo" ] && continue
+            local cache_dir="$REPOS_DIR/$repo"
+            local count=0
+            [ -d "$cache_dir" ] && count=$(find "$cache_dir" -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+            echo -e "  ${GREEN}$repo${NC} (branch: $branch, path: ${rpath:-/}) ${DIM}[$count cached]${NC}"
+        done <<< "$repo_configs"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Current modules:${NC}"
+    echo ""
+
+    local in_modules=false
+    while IFS= read -r line; do
+        if [[ "$line" == "modules:" ]]; then
+            in_modules=true
+            continue
+        fi
+        if $in_modules; then
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+(.*) ]]; then
+                local module="${BASH_REMATCH[1]}"
+                local resolved
+                if resolved=$(resolve_module "$module"); then
+                    local source
+                    source=$(module_source_label "$resolved")
+                    echo -e "  ${GREEN}✓${NC} $module ${DIM}($source)${NC}"
+                else
+                    echo -e "  ${RED}✗${NC} $module (not found — run 'brainbrew sync-repos')"
+                fi
+            elif [[ ! "$line" =~ ^[[:space:]]*$ && ! "$line" =~ ^[[:space:]]*# ]]; then
+                in_modules=false
+            fi
+        fi
+    done < "$CONFIG_FILE"
+
+    echo ""
+
+    if [ -f "$OUTPUT_FILE" ]; then
+        local size
+        size=$(wc -c < "$OUTPUT_FILE" | tr -d ' ')
+        info "$OUTPUT_FILE exists (${size} bytes)"
+    else
+        warn "$OUTPUT_FILE not generated yet. Run 'brainbrew compose'."
+    fi
+
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# usage
+# ---------------------------------------------------------------------------
+usage() {
+    cat << EOF
+
+${BOLD}brainbrew${NC} — Compose AI context from GitHub module repos
+
+${YELLOW}Usage:${NC}
+  brainbrew <command> [args]
+
+${YELLOW}Commands:${NC}
+  init                Initialize project (configure repo, pick modules)
+  update [repo]       Add default or custom repos to existing project
+  compose [options]   Compose context from .brainbrew.yml
+  add <module>        Add a module to current project
+  remove <module>     Remove a module from current project
+  list                List available modules
+  status              Show current project configuration
+  sync-repos          Fetch modules from configured GitHub repos
+  global              Install global Cursor rules & skills
+  link                Add brainbrew to PATH (/usr/local/bin)
+
+${YELLOW}Compose formats:${NC}
+  compose                    AGENTS.md (default)
+  compose --format copilot   .github/copilot-instructions.md
+  compose --format cursor    .cursor/rules/brainbrew.mdc
+  compose --format windsurf  .windsurfrules
+  compose --format claude    CLAUDE.md
+  compose --all              All formats at once
+
+${YELLOW}Sync:${NC}
+  sync-repos [--dry-run]  Fetch .md files from configured GitHub repos
+
+${YELLOW}Update:${NC}
+  update                     Interactive — offer defaults + ask for repo
+  update --defaults          Add default BrainBrew modules repo
+  update user/repo           Add a specific repo
+
+${YELLOW}Examples:${NC}
+  brainbrew init                     # Setup project (repo + modules)
+  brainbrew update --defaults        # Add default modules to existing project
+  brainbrew update user/ai-modules   # Add a custom repo
+  brainbrew sync-repos               # Re-fetch latest modules
+  brainbrew compose --all            # Generate for all AI tools
+  brainbrew add coding/conventions   # Add a module
+
+${YELLOW}Getting started:${NC}
+  1. ${GREEN}brainbrew link${NC}                # Add to PATH
+  2. ${GREEN}brainbrew init${NC}                 # Configure repo & pick modules
+  3. ${GREEN}brainbrew compose --all${NC}        # Generate for all AI tools
+
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+    init)       cmd_init ;;
+    update)     shift; cmd_update "${1:-}" ;;
+    compose)    shift; cmd_compose "$@" ;;
+    add)        shift; cmd_add "${1:-}" ;;
+    remove)     shift; cmd_remove "${1:-}" ;;
+    list)       cmd_list ;;
+    status)     cmd_status ;;
+    global)     cmd_global ;;
+    link)       cmd_link ;;
+    sync-repos) shift; cmd_sync_repos "${1:-}" ;;
+    help|-h|--help) usage ;;
+    *)          usage ;;
+esac

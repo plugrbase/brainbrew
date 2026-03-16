@@ -12,7 +12,7 @@ unset _source _dir
 REPOS_DIR=".ai-repos"
 CONFIG_FILE=".brainbrew.yml"
 OUTPUT_FILE="AGENTS.md"
-DEFAULT_REPO="plugrbase/brainbrew-modules-test"
+DEFAULT_REPO="plugrbase/brainbrew-modules"
 DEFAULT_BRANCH="main"
 
 RED=$'\033[0;31m'

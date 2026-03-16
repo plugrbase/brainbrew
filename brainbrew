@@ -38,12 +38,12 @@ parse_repos_config() {
     [ -f "$file" ] || return 0
 
     local in_repos=false
-    local repo="" branch="main" rpath=""
+    local repo="" branch="main" rpath="" token_env=""
 
     while IFS= read -r line || [ -n "$line" ]; do
         if [[ "$line" =~ ^[a-z_] ]] && [[ "$line" != "repos:" ]]; then
             if $in_repos && [ -n "$repo" ]; then
-                echo "$repo|$branch|$rpath"
+                echo "$repo|$branch|$rpath|$token_env"
             fi
             in_repos=false
             repo=""
@@ -52,18 +52,21 @@ parse_repos_config() {
 
         if [[ "$line" == "repos:" ]]; then
             in_repos=true
-            repo="" branch="main" rpath=""
+            repo="" branch="main" rpath="" token_env=""
             continue
         fi
 
         if $in_repos; then
             if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*repo:[[:space:]]*(.*) ]]; then
                 if [ -n "$repo" ]; then
-                    echo "$repo|$branch|$rpath"
+                    echo "$repo|$branch|$rpath|$token_env"
                 fi
                 repo="${BASH_REMATCH[1]}"
                 branch="main"
                 rpath=""
+                token_env=""
+            elif [[ "$line" =~ ^[[:space:]]+token_env:[[:space:]]*(.*) ]]; then
+                token_env="${BASH_REMATCH[1]}"
             elif [[ "$line" =~ ^[[:space:]]+branch:[[:space:]]*(.*) ]]; then
                 branch="${BASH_REMATCH[1]}"
             elif [[ "$line" =~ ^[[:space:]]+path:[[:space:]]*(.*) ]]; then
@@ -73,8 +76,26 @@ parse_repos_config() {
     done < "$file"
 
     if $in_repos && [ -n "$repo" ]; then
-        echo "$repo|$branch|$rpath"
+        echo "$repo|$branch|$rpath|$token_env"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# load_dotenv — source .env file if present (only KEY=VALUE lines, no export)
+# ---------------------------------------------------------------------------
+load_dotenv() {
+    local envfile="${1:-.env}"
+    [ -f "$envfile" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*#  ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$  ]] && continue
+        line="${line#export }"
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        val="${val#\"}" ; val="${val%\"}"
+        val="${val#\'}" ; val="${val%\'}"
+        [ -n "$key" ] && export "$key=$val"
+    done < "$envfile"
 }
 
 # ---------------------------------------------------------------------------
@@ -84,6 +105,10 @@ get_github_token() {
     if [ -n "${GITHUB_TOKEN:-}" ]; then
         echo "$GITHUB_TOKEN"
         return 0
+    fi
+    if command -v gh &>/dev/null; then
+        local token
+        token=$(gh auth token 2>/dev/null) && [ -n "$token" ] && echo "$token" && return 0
     fi
     return 0
 }
@@ -381,7 +406,7 @@ cmd_init() {
     echo ""
 
     local use_defaults=false
-    local repo_input="" branch_input="" path_input=""
+    local repo_input="" branch_input="" path_input="" token_env_input=""
 
     read -rp "Include default BrainBrew modules? [Y/n]: " defaults_reply
     if [[ ! "$defaults_reply" =~ ^[Nn]$ ]]; then
@@ -399,6 +424,7 @@ cmd_init() {
         read -rp "Branch [main]: " branch_input
         branch_input="${branch_input:-main}"
         read -rp "Path (subfolder, optional): " path_input
+        read -rp "Token env var for private repo (optional): " token_env_input
     fi
 
     _write_repos_section() {
@@ -412,6 +438,9 @@ cmd_init() {
             echo "    branch: $branch_input"
             if [ -n "$path_input" ]; then
                 echo "    path: $path_input"
+            fi
+            if [ -n "$token_env_input" ]; then
+                echo "    token_env: $token_env_input"
             fi
         fi
     }
@@ -553,11 +582,11 @@ _write_modules_to_config() {
 # _append_repo — add a repo entry to the repos: section in .brainbrew.yml
 # ---------------------------------------------------------------------------
 _append_repo() {
-    local repo="$1" branch="$2" rpath="${3:-}"
+    local repo="$1" branch="$2" rpath="${3:-}" tenv="${4:-}"
 
     local existing
     existing=$(parse_repos_config "$CONFIG_FILE")
-    while IFS='|' read -r r _ _; do
+    while IFS='|' read -r r _ _ _; do
         if [ "$r" = "$repo" ]; then
             warn "Repo '$repo' is already configured."
             return 1
@@ -567,6 +596,9 @@ _append_repo() {
     local entry="  - repo: $repo"$'\n'"    branch: $branch"
     if [ -n "$rpath" ]; then
         entry+=$'\n'"    path: $rpath"
+    fi
+    if [ -n "$tenv" ]; then
+        entry+=$'\n'"    token_env: $tenv"
     fi
 
     if grep -q "^repos:" "$CONFIG_FILE" 2>/dev/null; then
@@ -579,7 +611,7 @@ _append_repo() {
             for ((line=last_repo_line+1; line<=total_lines; line++)); do
                 local content
                 content=$(sed -n "${line}p" "$CONFIG_FILE")
-                if [[ "$content" =~ ^[[:space:]]+(branch|path): ]]; then
+                if [[ "$content" =~ ^[[:space:]]+(branch|path|token_env): ]]; then
                     insert_after="$line"
                 else
                     break
@@ -593,7 +625,7 @@ _append_repo() {
         fi
     fi
 
-    success "Added repo: $repo (branch: $branch${rpath:+, path: $rpath})"
+    success "Added repo: $repo (branch: $branch${rpath:+, path: $rpath}${tenv:+, token_env: $tenv})"
     return 0
 }
 
@@ -616,7 +648,9 @@ cmd_update() {
         branch_input="${branch_input:-main}"
         local path_input
         read -rp "Path (subfolder, optional): " path_input
-        if _append_repo "$repo_input" "$branch_input" "$path_input"; then
+        local token_env_input
+        read -rp "Token env var for private repo (optional): " token_env_input
+        if _append_repo "$repo_input" "$branch_input" "$path_input" "$token_env_input"; then
             added=true
         fi
     else
@@ -628,7 +662,7 @@ cmd_update() {
         local existing
         existing=$(parse_repos_config "$CONFIG_FILE")
         local has_defaults=false
-        while IFS='|' read -r r _ _; do
+        while IFS='|' read -r r _ _ _; do
             [ "$r" = "$DEFAULT_REPO" ] && has_defaults=true
         done <<< "$existing"
 
@@ -646,7 +680,9 @@ cmd_update() {
             branch_input="${branch_input:-main}"
             local path_input
             read -rp "Path (subfolder, optional): " path_input
-            _append_repo "$repo_input" "$branch_input" "$path_input" && added=true
+            local token_env_input
+            read -rp "Token env var for private repo (optional): " token_env_input
+            _append_repo "$repo_input" "$branch_input" "$path_input" "$token_env_input" && added=true
         fi
     fi
 
@@ -895,25 +931,30 @@ _sync_repo() {
     local tmp_tree="/tmp/brainbrew_tree_$$.json"
     local tmp_files="/tmp/brainbrew_files_$$.txt"
 
-    info "Fetching $repo (branch: $branch, path: ${rpath:-/})..."
+    local auth_info="no auth"
+    [ -n "$token" ] && auth_info="token ${token:0:4}…"
+    info "Fetching $repo (branch: $branch, path: ${rpath:-/}, auth: $auth_info)..."
 
     local tree_url="https://api.github.com/repos/$repo/git/trees/$branch?recursive=1"
     local http_code
 
-    if [ -n "$token" ]; then
-        http_code=$(curl -s -o "$tmp_tree" -w "%{http_code}" \
-            -H "Authorization: Bearer $token" \
-            -H "Accept: application/vnd.github+json" \
-            "$tree_url")
-    else
-        http_code=$(curl -s -o "$tmp_tree" -w "%{http_code}" \
-            -H "Accept: application/vnd.github+json" \
-            "$tree_url")
-    fi
+    local -a curl_headers=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+    [ -n "$token" ] && curl_headers+=(-H "Authorization: Bearer $token")
+
+    http_code=$(curl -s -o "$tmp_tree" -w "%{http_code}" "${curl_headers[@]}" "$tree_url")
 
     if [ "$http_code" != "200" ]; then
-        if [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
-            warn "$repo: HTTP $http_code — export GITHUB_TOKEN for private repos."
+        if [ "$http_code" = "404" ]; then
+            if [ -n "$token" ]; then
+                warn "$repo: HTTP 404 — repo not found or token lacks access."
+                warn "  For fine-grained tokens, ensure the token has access to this specific repository."
+            else
+                warn "$repo: HTTP 404 — repo not found. For private repos, configure token_env in .brainbrew.yml or export GITHUB_TOKEN."
+            fi
+        elif [ "$http_code" = "401" ]; then
+            warn "$repo: HTTP 401 — token is invalid or expired."
+        elif [ "$http_code" = "403" ]; then
+            warn "$repo: HTTP 403 — token lacks required permissions (needs: Contents read)."
         else
             warn "$repo: HTTP $http_code — skipping."
         fi
@@ -966,12 +1007,9 @@ for item in data.get('tree', []):
         mkdir -p "$(dirname "$target")"
         local raw_url="https://raw.githubusercontent.com/$repo/$branch/$full_path"
         local ok=false
-
-        if [ -n "$token" ]; then
-            curl -s -f -H "Authorization: Bearer $token" -o "$target" "$raw_url" 2>/dev/null && ok=true
-        else
-            curl -s -f -o "$target" "$raw_url" 2>/dev/null && ok=true
-        fi
+        local -a dl_args=(-s -f -o "$target")
+        [ -n "$token" ] && dl_args+=(-H "Authorization: Bearer $token")
+        curl "${dl_args[@]}" "$raw_url" 2>/dev/null && ok=true
 
         if $ok; then
             echo "    synced: ${rel_path%.md}"
@@ -1008,6 +1046,8 @@ cmd_sync_repos() {
 
     [ -f "$CONFIG_FILE" ] || error "No $CONFIG_FILE found. Run 'brainbrew init' first."
 
+    load_dotenv
+
     local token
     token=$(get_github_token)
 
@@ -1019,9 +1059,17 @@ cmd_sync_repos() {
         return
     fi
 
-    while IFS='|' read -r repo branch rpath; do
+    while IFS='|' read -r repo branch rpath token_env; do
         [ -z "$repo" ] && continue
-        _sync_repo "$repo" "$branch" "$rpath" "$token" "$dry_run"
+        local repo_token="$token"
+        if [ -n "$token_env" ]; then
+            repo_token="${!token_env:-}"
+            if [ -z "$repo_token" ]; then
+                warn "$repo: \$$token_env is not set — falling back to default token."
+                repo_token="$token"
+            fi
+        fi
+        _sync_repo "$repo" "$branch" "$rpath" "$repo_token" "$dry_run"
     done <<< "$repos"
 }
 
@@ -1089,12 +1137,14 @@ cmd_status() {
         echo ""
         echo -e "${BOLD}GitHub repos:${NC}"
         echo ""
-        while IFS='|' read -r repo branch rpath; do
+        while IFS='|' read -r repo branch rpath token_env; do
             [ -z "$repo" ] && continue
             local cache_dir="$REPOS_DIR/$repo"
             local count=0
             [ -d "$cache_dir" ] && count=$(find "$cache_dir" -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
-            echo -e "  ${GREEN}$repo${NC} (branch: $branch, path: ${rpath:-/}) ${DIM}[$count cached]${NC}"
+            local extra=""
+            [ -n "$token_env" ] && extra=" ${YELLOW}[private: \$$token_env]${NC}"
+            echo -e "  ${GREEN}$repo${NC} (branch: $branch, path: ${rpath:-/}) ${DIM}[$count cached]${NC}${extra}"
         done <<< "$repo_configs"
     fi
 
@@ -1176,6 +1226,15 @@ ${YELLOW}Update:${NC}
   update                     Interactive — offer defaults + ask for repo
   update --defaults          Add default BrainBrew modules repo
   update user/repo           Add a specific repo
+
+${YELLOW}Private repos:${NC}
+  Set token_env per repo in .brainbrew.yml to use a specific env var:
+    repos:
+      - repo: myorg/private-modules
+        branch: main
+        token_env: MYORG_GITHUB_TOKEN
+
+  Token resolution order: token_env > \$GITHUB_TOKEN > gh auth token
 
 ${YELLOW}Examples:${NC}
   brainbrew init                     # Setup project (repo + modules)
